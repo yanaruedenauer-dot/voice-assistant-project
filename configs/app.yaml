@@ -1,0 +1,21 @@
+
+app:
+  name: "Jeeves"
+  languages: ["en", "de"]
+  sentiment_on: true
+  transparency_on: true
+  cloud_fallbacks: false
+  min_privacy_mode: true
+
+providers:
+  places: "google"
+  booking: "mock"  # change to opentable when ready
+  accessibility_sources: ["google_places", "wheelmap", "osm"]
+
+ranking:
+  weights:
+    distance: 0.25
+    rating: 0.20
+    price: 0.10
+    accessibility: 0.30
+    preference_fit: 0.15

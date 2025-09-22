@@ -1,0 +1,23 @@
+
+intents:
+  - name: book_restaurant
+    description: Start a restaurant booking
+    slots:
+      - datetime
+      - party_size
+      - cuisine
+      - location
+      - dietary
+      - accessibility
+  - name: provide_info
+    description: Provide one of the requested slots
+
+entities:
+  cuisine: [italian, chinese, japanese, indian, mexican, german, greek, thai]
+  dietary: [vegan, vegetarian, gluten_free, none]
+  accessibility: [step_free, accessible_restroom, parking]
+
+examples:
+  - text: "Book a table for two tonight at 7 near Mitte, Italian."
+    intent: book_restaurant
+    slots: { party_size: 2, datetime: "today 19:00", location: "Mitte", cuisine: "italian" }
