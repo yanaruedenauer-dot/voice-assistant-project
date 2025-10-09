@@ -1,57 +1,73 @@
-#!/usr/bin/env python3
 """
 Whisper Mic Transcribe
 ----------------------
 Record audio from your microphone and transcribe it locally with OpenAI Whisper.
 
-Usage (examples):
-  # record 5s and transcribe (German forced), save WAV + TXT
+Examples:
   python whisper_mic_transcribe.py --seconds 5 --model small --language de \
       --outfile out.wav --transcript out.txt
 
-  # record 10s, auto language detect, CPU
   python whisper_mic_transcribe.py --seconds 10 --model base --device cpu
-
-Dependencies (install inside your conda env 'voice'):
-  pip install openai-whisper sounddevice numpy scipy
-  # if ffmpeg missing:
-  # conda install -c conda-forge ffmpeg
 """
+
+from __future__ import annotations
+
 import argparse
 import sys
 import time
 import queue
 from pathlib import Path
-
+from typing import Optional
+from scipy.io import wavfile as _wavfile
+import whisper
 import numpy as np
 import sounddevice as sd
-from scipy.io.wavfile import write as wav_write
 
+import os
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+# Prefer 'soundfile' for writing WAV; fall back to scipy
+try:
+    import soundfile as sf
+
+    _USE_SF = True
+except Exception:
+    from scipy.io import wavfile as _wavfile
+
+    _USE_SF = False
+
+# Core ML deps
 try:
     import torch
     import whisper
 except Exception:
     print(
-        "ERROR: Missing packages. Install inside your env:\n"
+        "ERROR: Missing packages.\n"
         "  pip install openai-whisper sounddevice numpy scipy\n"
-        "  conda install -c conda-forge ffmpeg  # if needed",
+        "If ffmpeg is missing:\n"
+        "  conda install -c conda-forge ffmpeg",
         file=sys.stderr,
     )
     raise
 
+
 # ----------------------------- Recording ---------------------------------- #
 
 
-def record(seconds: int, samplerate: int = 16000, channels: int = 1) -> np.ndarray:
+def record(
+    seconds: int,
+    samplerate: int = 16000,
+    channels: int = 1,
+    input_device: int | None = None,
+) -> np.ndarray:
     """
-    Record audio from default microphone.
-    Returns mono float32 array in range [-1, 1].
+    Record audio from default (or given) microphone and return mono float32 array in [-1, 1].
     """
     q: queue.Queue[np.ndarray] = queue.Queue()
 
     def callback(indata, frames, time_info, status):
         if status:
-            # over/underruns etc. are non-fatal; print to stderr
             print(f"SoundDevice status: {status}", file=sys.stderr)
         q.put(indata.copy())
 
@@ -61,11 +77,13 @@ def record(seconds: int, samplerate: int = 16000, channels: int = 1) -> np.ndarr
         dtype="float32",
         callback=callback,
         blocksize=0,
+        device=input_device,  # use CLI/param
+        latency="low",
     )
 
-    chunks = []
+    chunks: list[np.ndarray] = []
     with stream:
-        print(f"Recording {seconds} seconds... Speak now 🎤")
+        print(f" Recording {seconds}s … Speak now")
         start = time.time()
         while (time.time() - start) < seconds:
             try:
@@ -76,10 +94,10 @@ def record(seconds: int, samplerate: int = 16000, channels: int = 1) -> np.ndarr
 
     if not chunks:
         raise RuntimeError(
-            "No audio captured. Check mic permissions and default input device."
+            "No audio captured. Check mic permissions and default/input device."
         )
+
     audio = np.concatenate(chunks, axis=0)
-    # to mono
     if audio.ndim == 2 and audio.shape[1] > 1:
         audio = np.mean(audio, axis=1)
     else:
@@ -88,16 +106,21 @@ def record(seconds: int, samplerate: int = 16000, channels: int = 1) -> np.ndarr
 
 
 def save_wav(path: Path, audio: np.ndarray, samplerate: int = 16000) -> None:
-    """Save float32 mono audio to 16-bit PCM WAV."""
-    audio_int16 = np.clip(audio * 32767, -32768, 32767).astype(np.int16)
-    wav_write(str(path), samplerate, audio_int16)
+    """Save float32 mono audio to WAV. Uses soundfile if available, otherwise scipy."""
+    if _USE_SF:
+        sf.write(str(path), audio, samplerate)  # float32 OK
+    else:
+        # convert to int16 for scipy
+        pcm16 = np.clip(audio, -1.0, 1.0)
+        pcm16 = (pcm16 * 32767.0).astype(np.int16)
+        _wavfile.write(str(path), samplerate, pcm16)
 
 
-# ----------------------------- Transcription ------------------------------- #
+#  Transcription ------------------------------- #
 
 
-def pick_device(user_device: str | None) -> str:
-    """Choose best available device unless user fixed one."""
+def pick_device(user_device: Optional[str]) -> str:
+    """Choose device; honor user choice if provided."""
     if user_device:
         return user_device
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -107,93 +130,149 @@ def pick_device(user_device: str | None) -> str:
     return "cpu"
 
 
-def transcribe(model_name: str, wav_path: Path, language: str | None, device: str):
-    print(
-        f"Loading Whisper model '{model_name}' on {device} (first run will download the model)..."
-    )
-    model = whisper.load_model(model_name, device=device)
-    fp16 = device != "cpu"  # half precision only on GPU
+_MODEL = None  # cache
+
+
+def get_model(model_name: str, device: str):
+    global _MODEL
+    if _MODEL is None:
+        print(f" Loading Whisper model '{model_name}' on {device} (one-time)…")
+        _MODEL = whisper.load_model(model_name, device=device)
+    return _MODEL
+
+
+def transcribe(
+    model_name: str, wav_path: Path, language: Optional[str], device: str, **opts
+) -> str:
+    """
+    Transcribe a WAV with Whisper. Extra options (temperature, initial_prompt, etc.)
+    are accepted via **opts and forwarded to Whisper.
+    """
+    model = get_model(model_name, device)
+    fp16 = device != "cpu"
     print(f"Transcribing: {wav_path.name}")
-    result = model.transcribe(str(wav_path), language=language, fp16=fp16)
+    result = model.transcribe(
+        str(wav_path),
+        language=language,
+        fp16=fp16,
+        condition_on_previous_text=False,
+        **opts,  # forward temperature, initial_prompt, etc.
+    )
     return (result.get("text") or "").strip()
 
 
-# ----------------------------- CLI ---------------------------------------- #
+# --------------------------------- CLI ------------------------------------- #
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(
         description="Record audio from mic and transcribe with OpenAI Whisper."
     )
     ap.add_argument(
-        "--seconds",
+        "--seconds", type=int, default=10, help="Recording duration (seconds)"
+    )
+    ap.add_argument("--model", default="small", help="tiny|base|small|medium|large")
+    ap.add_argument("--outfile", default="recording.wav", help="WAV output path")
+    ap.add_argument("--transcript", default=None, help="Optional transcript .txt path")
+    ap.add_argument("--language", default=None, help="Language code like 'de' or 'en'")
+    ap.add_argument("--device", default=None, help="cpu | mps | cuda")
+    ap.add_argument(
+        "--input-device",
         type=int,
-        default=10,
-        help="Recording duration (seconds). Default: 10",
-    )
-    ap.add_argument(
-        "--model",
-        default="small",
-        help="Whisper model: tiny|base|small|medium|large (default: small)",
-    )
-    ap.add_argument(
-        "--outfile",
-        default="recording.wav",
-        help="Where to save the WAV (default: recording.wav)",
-    )
-    ap.add_argument(
-        "--transcript", default=None, help="Optional path to save transcript .txt"
-    )
-    ap.add_argument(
-        "--language",
         default=None,
-        help="Force language code, e.g. 'de' or 'en' (auto-detect if omitted)",
-    )
-    ap.add_argument(
-        "--device",
-        default=None,
-        help="Force device: cpu | mps | cuda (auto if omitted)",
+        help="Mic input device index (see sounddevice.query_devices())",
     )
     args = ap.parse_args()
 
     wav_path = Path(args.outfile)
 
     # 1) Record
-    try:
-        audio = record(seconds=args.seconds, samplerate=16000, channels=1)
-    except Exception as e:
-        print(f"ERROR during recording: {e}", file=sys.stderr)
-        print(
-            "On macOS, grant mic access: System Settings → Privacy & Security → Microphone.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+    audio = record(
+        seconds=args.seconds,
+        samplerate=16000,
+        channels=1,
+        input_device=args.input_device,
+    )
 
     # 2) Save WAV
-    try:
-        save_wav(wav_path, audio, samplerate=16000)
-        print(f"Saved recording to: {wav_path}")
-    except Exception as e:
-        print(f"ERROR saving WAV: {e}", file=sys.stderr)
-        sys.exit(3)
+    save_wav(wav_path, audio, samplerate=16000)
+    print(f" WAV saved to: {wav_path}")
 
     # 3) Transcribe
+    device = pick_device(args.device)
+    text = transcribe(args.model, wav_path, args.language, device)
+
+    # 4) Output
+    print("\n=== TRANSCRIPT ===")
+    print(text if text else "[No speech detected]")
+
+    if args.transcript:
+        Path(args.transcript).write_text((text or "") + "\n", encoding="utf-8")
+        print(f"\n Transcript saved to: {args.transcript}")
+
+
+# --------------- Helper used by run_local.py (voice I/O) ------------------- #
+
+
+def transcribe_once(
+    seconds: int = 5,
+    model: str = "small",
+    language: str | None = None,
+    device: str | None = None,
+    input_device: int | None = None,
+    temperature: float = 0.0,
+    initial_prompt: str | None = None,
+) -> str:
+    """
+    Record from the microphone for `seconds` and return a Whisper transcript.
+    - Never prints the transcript (so no duplicates).
+    - Always returns a string ("" on failure).
+    - Safely removes the temporary WAV.
+    """
+    from pathlib import Path
+
+    tmp_wav = Path(".tmp_whisper_recording.wav")
+    text: str = ""
+
     try:
-        device = pick_device(args.device)
-        text = transcribe(args.model, wav_path, args.language, device)
-        print("\n=== TRANSCRIPT ===")
-        print(text if text else "[No speech detected]")
-        if args.transcript:
-            Path(args.transcript).write_text((text or "") + "\n", encoding="utf-8")
-            print(f"\nTranscript saved to: {args.transcript}")
-    except Exception as e:
-        print(f"ERROR during transcription: {e}", file=sys.stderr)
-        print(
-            "Check that ffmpeg is installed and on PATH. In conda:\n"
-            "  conda install -c conda-forge ffmpeg",
-            file=sys.stderr,
+        # 1) Record
+        audio = record(
+            seconds=seconds,
+            samplerate=16000,
+            channels=1,
+            input_device=input_device,
         )
-        sys.exit(4)
+
+        # 2) Save temporary WAV
+        save_wav(tmp_wav, audio, samplerate=16000)
+
+        # 3) Transcribe (no printing here)
+        dev = pick_device(device)
+        result = transcribe(
+            model,  # model name, e.g. "base"
+            tmp_wav,  # Path to wav
+            language,  # e.g. "de" or "en"
+            dev,  # "cpu" | "mps" | "cuda"
+            temperature=temperature,
+            initial_prompt=initial_prompt,
+        )
+
+        # Ensure a string is returned
+        text = result or ""
+        return text
+
+    except Exception as e:
+        # Keep helper silent except for a short warning
+        print(f"[WARN] Transcription failed: {e}")
+        return ""
+
+    finally:
+        # 4) Cleanup
+        try:
+            if tmp_wav.exists():
+                tmp_wav.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

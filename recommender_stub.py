@@ -1,4 +1,3 @@
-# recommender_stub.py
 from datetime import datetime
 
 

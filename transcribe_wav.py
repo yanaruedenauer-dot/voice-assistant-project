@@ -41,7 +41,6 @@ def main():
     )
     model = whisper.load_model(args.model, device=device)
 
-    # fp16 only useful on GPU
     fp16 = device != "cpu"
 
     print(f"Transcribing: {audio_path.name}")
